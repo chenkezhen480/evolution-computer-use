@@ -1,0 +1,89 @@
+// tests/computerAlarm.test.ts
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { createRoutines } from '../src/procedures/routines.ts';
+import { createProcedureLibrary } from '../src/procedures/library.ts';
+import type { Page } from '../src/browser/page.ts';
+
+const tool = (name: string, extra: object) => JSON.stringify({ name, description: name, params: {}, steps: [{ open: `https://example.com/${name}` }], ...extra });
+
+test('her alarm tools run in a scratch tab, one line each; a failure says so', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'computer-alarm-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const library = createProcedureLibrary(dir);
+  library.save(tool('bili_unread', { onAlarm: true, summary: '私信 2' }));
+  library.save(tool('broken', { onAlarm: true }));
+  library.save(tool('not_alarm', {}));
+  const opened: string[] = [];
+  const page = { open: async (url: string) => { opened.push(url); if (url.endsWith('broken')) throw new Error('打不开'); }, brief: async () => '页' } as unknown as Page;
+  let scratches = 0;
+  const facts = createRoutines({ library, browser: { scratch: async work => { scratches++; return work(page, new AbortController().signal); } } });
+  assert.equal(await facts(), '未分类/bili_unread：私信 2\n未分类/broken 没跑通（第 1 步：打不开）\n上面没跑通的，现在就修：先用 page_* 或 desktop 把这件事做完，再把走通的步骤用原来的名字 procedure_save 成新版（不另起一个新的），存完跑一次确认。');
+  assert.equal(scratches, 2);
+  assert.deepEqual(opened, ['https://example.com/bili_unread', 'https://example.com/broken']);
+  assert.equal(library.lastRun('未分类/broken')?.ok, false);
+});
+
+test('no alarm tools is nothing to add; a tool past its time is cut off and said', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'computer-alarm-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const library = createProcedureLibrary(dir);
+  const never = { scratch: async () => new Promise<never>(() => {}) };
+  assert.equal(await createRoutines({ library, browser: never })(), undefined);
+  library.save(tool('slow', { onAlarm: true }));
+  assert.match(await createRoutines({ library, browser: never, perToolMs: 20 })() ?? '', /^未分类\/slow 没跑通（超过 1 秒）\n上面没跑通的，现在就修：/);
+});
+
+test('a tool past its time is aborted and recorded; the next one still runs; an empty budget says so', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'computer-alarm-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const library = createProcedureLibrary(dir);
+  library.save(tool('a_hung', { onAlarm: true }));
+  library.save(tool('b_fine', { onAlarm: true }));
+  const signals: AbortSignal[] = [];
+  const page = { open: async () => {}, brief: async () => '页' } as unknown as Page;
+  let calls = 0;
+  const browser = { scratch: async (work: (page: Page, signal: AbortSignal) => Promise<unknown>) => {
+    const signal = new AbortController().signal; signals.push(signal);
+    return ++calls === 1 ? new Promise<never>(() => {}) : work(page, signal);
+  } };
+  const lines = (await createRoutines({ library, browser: browser as never, perToolMs: 20 })())!.split('\n');
+  assert.match(lines[0]!, /^未分类\/a_hung 没跑通（超过 1 秒）$/);
+  assert.match(lines[1]!, /^未分类\/b_fine：/);
+  assert.equal(library.lastRun('未分类/a_hung')?.ok, false);
+  assert.equal(library.lastRun('未分类/b_fine')?.ok, true);
+  assert.equal(await createRoutines({ library, browser: browser as never, totalMs: 0 })(), '未分类/a_hung 没来得及跑（例行的时间用完了）\n未分类/b_fine 没来得及跑（例行的时间用完了）');
+});
+
+test('the work of a tool past its time is told to stop, not left running', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'computer-alarm-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const library = createProcedureLibrary(dir);
+  library.save(JSON.stringify({ name: 'slow', description: 'slow', params: {}, onAlarm: true, steps: [{ open: 'https://example.com/1' }, { open: 'https://example.com/2' }] }));
+  const opened: string[] = [];
+  const page = { open: async (url: string) => { opened.push(url); await new Promise(resolve => setTimeout(resolve, 60)); }, brief: async () => '页' } as unknown as Page;
+  const browser = { scratch: <T>(work: (page: Page, signal: AbortSignal) => Promise<T>) => work(page, new AbortController().signal) };
+  await createRoutines({ library, browser, perToolMs: 20 })();
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.deepEqual(opened, ['https://example.com/1']);
+});
+
+test('the per-tool signal is handed to the browser so a queued run that times out opens no tab later', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'computer-alarm-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const library = createProcedureLibrary(dir);
+  library.save(JSON.stringify({ name: 'queued', description: 'q', params: {}, onAlarm: true, steps: [{ open: 'https://example.com/1' }] }));
+  let given: AbortSignal | undefined;
+  const browser = { scratch: (_work: unknown, signal?: AbortSignal) => { given = signal; return new Promise<never>(() => {}); } };
+  await createRoutines({ library, browser: browser as never, perToolMs: 20 })();
+  assert.equal(given?.aborted, true);
+});
+
+test('an alarm tool whose newest version broke runs a kept one and says so', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'computer-alarm-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const library = createProcedureLibrary(dir);
+  library.save(tool('bili_unread', { onAlarm: true, summary: '私信 2', steps: [{ open: 'https://example.com/old' }] }));
+  library.save(tool('bili_unread', { onAlarm: true, summary: '私信 2' }));
+  const page = { open: async (url: string) => { if (!url.endsWith('old')) throw new Error('打不开'); }, brief: async () => '页' } as unknown as Page;
+  const facts = createRoutines({ library, browser: { scratch: async work => work(page, new AbortController().signal) } });
+  assert.equal(await facts(), '未分类/bili_unread：私信 2（最新版没跑通，用的第 1 版）');
+  assert.equal(library.lastRun('未分类/bili_unread')?.ok, true);
+});
