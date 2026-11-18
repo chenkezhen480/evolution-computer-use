@@ -23,33 +23,28 @@ No runtime dependencies: the browser side uses only Node's built-in `WebSocket` 
 
 ## Setup
 
-Requires Node.js 22.16 or later.
+Requires Node.js 22.16 or later. There is nothing to download or build by hand: the configurations below run the [npm package](https://www.npmjs.com/package/evolution-computer-use) through `npx`, which fetches it on first use.
 
-```powershell
-git clone https://github.com/chenkezhen480/evolution-computer-use.git D:\tools\evolution-computer-use
-cd D:\tools\evolution-computer-use
-npm install
-npm run build        # builds lib/; the configurations below run lib/cli.js
-```
+`--desktop` defaults to `off` (the agent's own browser only); to let the agent use your computer, pass `background` or `foreground`, as described in [The user's computer](#the-users-computer).
 
-Replace the paths below with your own. `--desktop` defaults to `off` (the agent's own browser only); to let the agent use your computer, pass `background` or `foreground`, as described in [The user's computer](#the-users-computer).
+On Windows, `npx` is a batch file (`npx.cmd`) that some clients cannot start directly, so the examples start it through `cmd /c`. On macOS and Linux, drop `cmd /c` and make `npx` the command.
 
 ### Claude Code
 
-As a plugin (recommended; runs from source, no build needed):
+```powershell
+claude mcp add --scope user evolution-computer-use -- cmd /c npx -y evolution-computer-use --desktop background
+```
+
+`--scope user` makes it available in every project; leave it out to add it to the current project only.
+
+It also installs as a plugin, which Claude Code fetches from GitHub with git and runs from source:
 
 ```text
 /plugin marketplace add chenkezhen480/evolution-computer-use
 /plugin install evolution-computer-use
 ```
 
-A local clone works too: give its path to `marketplace add`.
-
-Or add only the MCP server:
-
-```powershell
-claude mcp add evolution-computer-use -- node D:/tools/evolution-computer-use/lib/cli.js --desktop background
-```
+The plugin starts with desktop control off. To pass `--desktop`, use `claude mcp add` as above.
 
 ### Codex CLI
 
@@ -57,8 +52,8 @@ claude mcp add evolution-computer-use -- node D:/tools/evolution-computer-use/li
 
 ```toml
 [mcp_servers.evolution-computer-use]
-command = "node"
-args = ["D:/tools/evolution-computer-use/lib/cli.js", "--desktop", "background"]
+command = "cmd"
+args = ["/c", "npx", "-y", "evolution-computer-use", "--desktop", "background"]
 # Recording up to two minutes of video, or waiting in the browser queue, can exceed the default 60 s
 tool_timeout_sec = 180
 ```
@@ -71,8 +66,8 @@ These clients take the `mcpServers` form (`.cursor/mcp.json` for Cursor, `claude
 {
   "mcpServers": {
     "evolution-computer-use": {
-      "command": "node",
-      "args": ["D:/tools/evolution-computer-use/lib/cli.js", "--desktop", "background"]
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "evolution-computer-use", "--desktop", "background"]
     }
   }
 }
@@ -82,14 +77,31 @@ These clients take the `mcpServers` form (`.cursor/mcp.json` for Cursor, `claude
 
 Any stdio MCP client works.
 
-- **Command:** `node <path>/lib/cli.js [options]`.
+- **Command:** `npx -y evolution-computer-use [options]`.
 - **Protocol versions:** 2025-06-18, 2025-03-26 and 2024-11-05.
 - **Instructions:** the usage guide is sent in `instructions` at initialization.
 - **Images:** screenshots come back as MCP `image` content. `page_shot` and `desktop` are only useful if the client passes images to the model.
 
+### From source
+
+For development, or to run changes not yet published:
+
+```powershell
+git clone https://github.com/chenkezhen480/evolution-computer-use.git D:\tools\evolution-computer-use
+cd D:\tools\evolution-computer-use
+npm install
+npm run build        # builds lib/
+```
+
+Then, in the configurations above, replace `cmd /c npx -y evolution-computer-use` with `node D:/tools/evolution-computer-use/lib/cli.js`. A local clone also works as a Claude Code plugin: give its path to `/plugin marketplace add`.
+
 ### Embedding in JS/TS
 
 Hosts that do not speak MCP (your own agent loop, a DSH plugin) use the library directly:
+
+```powershell
+npm install evolution-computer-use
+```
 
 ```ts
 import { createComputerUse, INSTRUCTIONS } from 'evolution-computer-use';
@@ -126,6 +138,8 @@ evolution-computer-use resume [options]    release the agent after the user pres
 evolution-computer-use routines [options]  run the routine procedures once and print the results (for schedulers)
 evolution-computer-use status [options]    list learned procedures and anything broken
 ```
+
+Without a global install (`npm install -g evolution-computer-use`), put `npx -y` in front, for example `npx -y evolution-computer-use resume`.
 
 | Option | Meaning |
 | --- | --- |
@@ -312,7 +326,7 @@ To stop it, press Esc twice within half a second, or click the capsule's button:
 - If no step was under way, the agent's next tool result carries the same message.
 - Until you release it, every action on the computer is refused; looking at a finished recording still works.
   - The stop is kept in `<data>/desktop-stopped`, so restarting the agent does not lift it.
-  - When you are satisfied, run `evolution-computer-use resume` in a terminal, adding `--data` if the data folder is not the default.
+  - When you are satisfied, run `npx -y evolution-computer-use resume` in a terminal, adding `--data` if the data folder is not the default.
 
 ## Inbox
 

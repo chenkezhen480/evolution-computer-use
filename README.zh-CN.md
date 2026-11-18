@@ -16,33 +16,28 @@
 
 ## 接入
 
-需要 Node.js 22.16 或更高。先装好：
+需要 Node.js 22.16 或更高。不用手动下载或 build：下面的配置都通过 `npx` 运行 [npm 上的包](https://www.npmjs.com/package/evolution-computer-use)，第一次用时自动下载。
 
-```powershell
-git clone https://github.com/chenkezhen480/evolution-computer-use.git D:\tools\evolution-computer-use
-cd D:\tools\evolution-computer-use
-npm install
-npm run build        # 生成 lib/，下面的配置用 lib/cli.js
-```
+`--desktop` 默认是 `off`（只有专用浏览器），要让 Agent 操作你的电脑就写 `background` 或 `foreground`，见「用户的电脑」。
 
-以下配置里的路径换成你自己的。`--desktop` 默认是 `off`（只有专用浏览器），要让 Agent 操作你的电脑就写 `background` 或 `foreground`，见「用户的电脑」。
+Windows 上的 `npx` 是个批处理文件（`npx.cmd`），有的客户端不能直接启动它，所以下面的例子都用 `cmd /c` 包一层。macOS 和 Linux 上去掉 `cmd /c`，直接把 `npx` 当命令。
 
 ### Claude Code
 
-当插件装（推荐，不用 build，直接从源码跑）：
+```powershell
+claude mcp add --scope user evolution-computer-use -- cmd /c npx -y evolution-computer-use --desktop background
+```
+
+`--scope user` 让所有项目都能用；不写就只加到当前项目。
+
+也可以当插件装，Claude Code 会用 git 从 GitHub 拉下来，直接从源码跑：
 
 ```text
 /plugin marketplace add chenkezhen480/evolution-computer-use
 /plugin install evolution-computer-use
 ```
 
-已经 clone 到本地的，`marketplace add` 后面也可以写本地路径。
-
-或者只加 MCP 服务器：
-
-```powershell
-claude mcp add evolution-computer-use -- node D:/tools/evolution-computer-use/lib/cli.js --desktop background
-```
+插件启动时桌面控制是关的；要传 `--desktop`，就用上面的 `claude mcp add`。
 
 ### Codex CLI
 
@@ -50,8 +45,8 @@ claude mcp add evolution-computer-use -- node D:/tools/evolution-computer-use/li
 
 ```toml
 [mcp_servers.evolution-computer-use]
-command = "node"
-args = ["D:/tools/evolution-computer-use/lib/cli.js", "--desktop", "background"]
+command = "cmd"
+args = ["/c", "npx", "-y", "evolution-computer-use", "--desktop", "background"]
 # 录 2 分钟以内的视频、等浏览器排队都可能超过默认的 60 秒
 tool_timeout_sec = 180
 ```
@@ -64,8 +59,8 @@ tool_timeout_sec = 180
 {
   "mcpServers": {
     "evolution-computer-use": {
-      "command": "node",
-      "args": ["D:/tools/evolution-computer-use/lib/cli.js", "--desktop", "background"]
+      "command": "cmd",
+      "args": ["/c", "npx", "-y", "evolution-computer-use", "--desktop", "background"]
     }
   }
 }
@@ -73,11 +68,28 @@ tool_timeout_sec = 180
 
 ### 其他支持 MCP 的 Agent
 
-任何 stdio 方式的 MCP 客户端都能用：命令是 `node <路径>/lib/cli.js [选项]`。服务器支持协议版本 2025-06-18、2025-03-26、2024-11-05，初始化时会把用法说明放在 `instructions` 里。截图以 MCP 的 `image` 内容返回，客户端要能把图片交给模型，`page_shot` 和 `desktop` 才有用。
+任何 stdio 方式的 MCP 客户端都能用：命令是 `npx -y evolution-computer-use [选项]`。服务器支持协议版本 2025-06-18、2025-03-26、2024-11-05，初始化时会把用法说明放在 `instructions` 里。截图以 MCP 的 `image` 内容返回，客户端要能把图片交给模型，`page_shot` 和 `desktop` 才有用。
+
+### 从源码运行
+
+开发时，或者要用还没发布的改动：
+
+```powershell
+git clone https://github.com/chenkezhen480/evolution-computer-use.git D:\tools\evolution-computer-use
+cd D:\tools\evolution-computer-use
+npm install
+npm run build        # 生成 lib/
+```
+
+然后把上面配置里的 `cmd /c npx -y evolution-computer-use` 换成 `node D:/tools/evolution-computer-use/lib/cli.js`。本地 clone 也能当 Claude Code 插件装：`/plugin marketplace add` 后面写本地路径。
 
 ### 在 JS/TS 里直接嵌入
 
 不走 MCP 的宿主（比如自己写的 Agent 循环、DSH 插件）直接用库：
+
+```powershell
+npm install evolution-computer-use
+```
 
 ```ts
 import { createComputerUse, INSTRUCTIONS } from 'evolution-computer-use';
@@ -105,6 +117,8 @@ evolution-computer-use resume [选项]    用户按了「停下」之后解除
 evolution-computer-use routines [选项]  跑一遍例行操作并打印结果，给计划任务用
 evolution-computer-use status [选项]    列出学会的操作和有问题的地方
 ```
+
+没有全局安装（`npm install -g evolution-computer-use`）的话，前面加 `npx -y`，比如 `npx -y evolution-computer-use resume`。
 
 | 选项 | 说明 |
 | --- | --- |
@@ -233,7 +247,7 @@ Agent 动手时屏幕顶部正中浮出一个深色胶囊「<名字>正在操作
 
 - 正在做的那一步作废，Agent 收到「用户按了停下……别重试，先问问用户」；正在录的立刻停在那里，之后不再给那个窗口发任何按键。
 - 按下时它没有正在做的一步，它的下一个工具结果后面会附上这句话。
-- 在你解除之前，所有动电脑的操作都会被拒绝（回看录好的还可以）。停下会记在 `<数据目录>/desktop-stopped`，Agent 重启也不会自动解除。确认没问题后在终端运行 `evolution-computer-use resume`（数据目录不是默认的就加 `--data`）。
+- 在你解除之前，所有动电脑的操作都会被拒绝（回看录好的还可以）。停下会记在 `<数据目录>/desktop-stopped`，Agent 重启也不会自动解除。确认没问题后在终端运行 `npx -y evolution-computer-use resume`（数据目录不是默认的就加 `--data`）。
 
 ## 信箱
 

@@ -75,7 +75,7 @@ function open(options: Options, hooks: { onToolsChanged?(): void; onHalt?(): voi
  */
 async function serve(options: Options): Promise<void> {
   const stopFile = join(options.data, STOP_FILE);
-  const resumeHint = `（解除：用户在终端运行 evolution-computer-use resume${options.data === resolve(join(homedir(), '.evolution-computer-use')) ? '' : ` --data "${options.data}"`}）`;
+  const resumeHint = `（解除：用户在终端运行 npx -y evolution-computer-use resume${options.data === resolve(join(homedir(), '.evolution-computer-use')) ? '' : ` --data "${options.data}"`}）`;
   let server: ReturnType<typeof serveMcp> | undefined;
   const computer = open(options, {
     onToolsChanged: () => server?.toolsChanged(),
