@@ -4,6 +4,8 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { browserCandidates, findBrowser, launchArgs, launchBrowser, runningPort } from '../src/browser/edge.ts';
+import { Faults } from '../src/shared/faults.ts';
+import type { Cdp } from '../src/browser/cdp.ts';
 
 test('Edge is looked for before Chrome, machine-wide before per-user', () => {
   const list = browserCandidates({ 'PROGRAMFILES(X86)': 'X86', PROGRAMFILES: 'PF', LOCALAPPDATA: 'LA' });
@@ -39,4 +41,41 @@ test('a port file is trusted only while the browser answers on it', async t => {
 test('a browser that cannot be started is reported, not waited for', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'computer-edge-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
   await assert.rejects(launchBrowser(join(dir, 'missing.exe'), dir, 2000), /浏览器没能启动/);
+});
+
+test('with no Windows at all, the usual Linux and macOS places are looked in, and the PATH too', () => {
+  const list = browserCandidates({ PATH: '/usr/local/bin:/opt/x/bin' });
+  assert.ok(list.length > 0);
+  assert.ok(list.some(path => /google-chrome/.test(path)), 'a Chrome on the PATH is a browser');
+  assert.ok(list.some(path => /Applications.*Chrome.*app/.test(path)), 'macOS puts its browsers under /Applications');
+  assert.ok(list.every(path => path.startsWith('/')), 'every candidate is an absolute path');
+});
+
+test('a browser that no longer works is skipped for the next one', async () => {
+  const asked: string[] = [];
+  const launched = await (async () => {
+    // The first candidate refuses to start, as the Debian chromium snap stub does with exit code 1.
+    const page = await import('../src/browser/browser.ts');
+    const browser = page.createBrowser({
+      profileDir: '/tmp/unused-profile', faults: new Faults(),
+      find: () => ['/usr/bin/chromium-browser', '/usr/local/bin/google-chrome'],
+      running: async () => 0,
+      launch: async binary => { asked.push(binary); if (binary.includes('chromium-browser')) throw new Error('浏览器进程启动后就退出了'); return 9333; },
+      targets: async () => [{ id: 't', type: 'page', url: 'about:blank', title: '', webSocketDebuggerUrl: 'ws://x' }],
+      connect: async () => ({ send: async () => ({ result: { value: { url: 'u', title: 't', controls: [], text: '' } } }), on: () => () => {}, close() {}, closed: false } as unknown as Cdp),
+    });
+    return await browser.run(async page => page.brief());
+  })();
+  assert.deepEqual(asked, ['/usr/bin/chromium-browser', '/usr/local/bin/google-chrome'], 'the second candidate is tried after the first fails');
+  assert.match(launched, /^t · u/);
+});
+
+test('headless and no-sandbox are arguments only in the mode that asks for them', () => {
+  const plain = launchArgs('D:/w/browser');
+  assert.ok(!plain.some(arg => arg.startsWith('--headless')));
+  assert.ok(!plain.includes('--no-sandbox'));
+  const headless = launchArgs('D:/w/browser', { headless: true, noSandbox: true });
+  assert.ok(headless.includes('--headless=new'));
+  assert.ok(headless.includes('--no-sandbox'));
+  assert.ok(headless.includes('--disable-dev-shm-usage'));
 });

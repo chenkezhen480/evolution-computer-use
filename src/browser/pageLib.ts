@@ -6,7 +6,11 @@
  */
 export const PAGE_LIB = String.raw`(() => {
   const VERSION = 1;
-  if (window.__evolutionCU && window.__evolutionCU.version === VERSION) return;
+  // A document that replaced another one keeps neither the numbers nor the elements, and a node from the old document
+  // still answers isConnected inside its own tree: trusting the old registry hands getComputedStyle and TreeWalker a
+  // node they throw on, instead of saying the element is gone. So the registry is rebuilt for the new document, while
+  // the numbering carries on from the highest number already handed out.
+  if (window.__evolutionCU && window.__evolutionCU.version === VERSION && window.__evolutionCU.document === document) return;
   const SELECTOR = 'a[href],button,input:not([type="hidden"]),select,textarea,summary,label[for],[contenteditable="true"],[tabindex]:not([tabindex="-1"]),[role="button"],[role="link"],[role="tab"],[role="checkbox"],[role="radio"],[role="switch"],[role="combobox"],[role="menuitem"],[role="option"],[role="textbox"],[role="searchbox"]';
   const refs = new Map(); const ids = new WeakMap(); let seq = Number(window.__evolutionCUBase) || 0;
   const clean = s => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
@@ -35,7 +39,11 @@ export const PAGE_LIB = String.raw`(() => {
   // The innermost of nested matches: a page wraps the same words in several boxes.
   const innermost = hits => hits.filter(el => !hits.some(other => other !== el && el.contains(other)));
   const locate = (a, scope, rs) => innermost(visibleMatches(a, scope, rs))[a.nth || 0] || null;
-  const find = ref => { const el = refs.get(ref); if (!el || !el.isConnected) { refs.delete(ref); return null; } return el; };
+  const find = ref => {
+    const el = refs.get(ref);
+    if (!el || !el.isConnected || el.ownerDocument !== document) { refs.delete(ref); return null; }
+    return el;
+  };
   const target = (t, rs) => t.ref !== undefined ? find(t.ref) : locate(t.anchor, null, rs);
   const reaches = (el, hit) => { for (let n = el; n; n = n.getRootNode().host) if (n === hit || n.contains(hit)) return true; return false; };
   const controls = (scope, rs) => {
@@ -60,6 +68,7 @@ export const PAGE_LIB = String.raw`(() => {
   };
   window.__evolutionCU = {
     version: VERSION,
+    document,
     snapshot(ref, budget) {
       const scope = ref == null ? null : find(ref);
       if (ref != null && !scope) return { missing: true };

@@ -4,17 +4,85 @@ import { join } from 'node:path';
 
 /**
  * Edge first: every Windows has it, and it speaks the same DevTools protocol as Chrome. Machine-wide installs live
- * under Program Files, per-user ones under LocalAppData. Ported from dsh-inner-browser-use (MIT, see NOTICE.md).
+ * under Program Files, per-user ones under LocalAppData. Where there is no Windows (%PROGRAMFILES% is unset), the
+ * usual places on Linux and macOS stand in for it. Ported from dsh-inner-browser-use (MIT, see NOTICE.md).
  */
 export function browserCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
   const roots = [env['PROGRAMFILES(X86)'], env['PROGRAMFILES'], env['LOCALAPPDATA']].filter((root): root is string => typeof root === 'string' && root !== '');
+  if (roots.length === 0) {
+    const onPath = pathDirs(env).flatMap(dir => POSIX_NAMES.map(name => join(dir, name)));
+    return [...POSIX_CHROME, ...onPath.filter(path => !POSIX_CHROME.includes(path))];
+  }
   return [
     ...roots.map(root => join(root, 'Microsoft', 'Edge', 'Application', 'msedge.exe')),
     ...roots.map(root => join(root, 'Google', 'Chrome', 'Application', 'chrome.exe')),
   ];
 }
 
+/**
+ * Real browser binaries that speak the DevTools protocol. `/usr/bin/chromium-browser` on Debian and Ubuntu is not one:
+ * it is a stub for the snap, prints "requires the chromium snap" and exits 1. It stays on the list because on other
+ * distributions that path is the browser itself; the launcher tries the next candidate when one refuses to start.
+ */
+const POSIX_NAMES = [
+  'google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser',
+  'microsoft-edge', 'microsoft-edge-stable',
+];
+/** Fixed places first, then whatever the PATH offers: a browser unpacked by hand usually lives on the PATH only. */
+const POSIX_CHROME = [
+  '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable',
+  '/opt/google/chrome/chrome',
+  '/usr/bin/chromium', '/usr/bin/chromium-browser',
+  '/usr/bin/microsoft-edge', '/usr/bin/microsoft-edge-stable', '/opt/microsoft/msedge/msedge',
+  '/snap/bin/chromium',
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+];
+
+/** Every directory on the PATH, so `~/.local/bin/google-chrome` or an unpacked build is found like a packaged one. */
+function pathDirs(env: NodeJS.ProcessEnv): string[] {
+  return (env['PATH'] ?? '').split(':').filter(dir => dir.startsWith('/'));
+}
+
 export const findBrowser = (candidates = browserCandidates(), exists: (path: string) => boolean = existsSync) => candidates.find(path => exists(path));
+
+/** Every binary that exists, in order: the first one that does not die on start is kept. */
+export const existingBrowsers = (candidates = browserCandidates(), exists: (path: string) => boolean = existsSync) => candidates.filter(path => exists(path));
+
+/**
+ * A browser started with no window: headless, and without its sandbox where the system has none to give it (a
+ * container, `proot`, a machine without user namespaces). A visible window is still the default on a desktop.
+ */
+export interface LaunchMode { headless: boolean; noSandbox: boolean }
+
+/**
+ * Whether Chromium's sandbox can work here: it needs a setuid `chrome-sandbox`, or unprivileged user namespaces. `proot`,
+ * most containers and many hardened hosts have neither, and a browser that starts without them exits before opening
+ * its debugging port, which reads as "the browser refused to start".
+ */
+let sandboxVerdict: boolean | undefined;
+function sandboxUsable(): boolean {
+  if (sandboxVerdict !== undefined) return sandboxVerdict;
+  sandboxVerdict = false;
+  try {
+    if (readFileSync('/proc/sys/kernel/unprivileged_userns_clone', 'utf8').trim() === '1') sandboxVerdict = true;
+  } catch { /* no such switch: ask the sysctl below instead */ }
+  try {
+    // `user.max_user_namespaces` is 0 where namespaces are switched off, absent on older kernels.
+    const limits = readFileSync('/proc/sys/user/max_user_namespaces', 'utf8').trim();
+    sandboxVerdict = sandboxVerdict || (Number(limits) > 0);
+  } catch { /* kernel without user namespaces at all */ }
+  return sandboxVerdict;
+}
+
+export function defaultLaunchMode(env: NodeJS.ProcessEnv = process.env): LaunchMode {
+  const linux = process.platform === 'linux';
+  return {
+    // No display to put a window on: the choice is headless or nothing.
+    headless: linux && !env['DISPLAY'] && !env['WAYLAND_DISPLAY'],
+    noSandbox: linux && !sandboxUsable(),
+  };
+}
 
 const portFile = (profileDir: string) => join(profileDir, 'DevToolsActivePort');
 /** The browser writes this file itself, so a read may catch it half-written or locked: that is no port yet. */
@@ -41,7 +109,11 @@ export async function runningPort(profileDir: string, fetchImpl: typeof fetch = 
  * A visible window on its own profile: the agent's logins stay in it, and it is never the person's own browser. Behind other
  * windows it keeps running at full speed. No `--remote-allow-origins`: only this process connects, web pages must not.
  */
-export const launchArgs = (profileDir: string) => [
+export const launchArgs = (profileDir: string, mode: LaunchMode = { headless: false, noSandbox: false }) => [
+  // Optional, because they are the only two arguments a plain desktop does not want: a headless browser is one the
+  // person cannot log in through, and no sandbox is a hole they did not ask for.
+  ...(mode.headless ? ['--headless=new'] : []),
+  ...(mode.noSandbox ? ['--no-sandbox', '--disable-dev-shm-usage'] : []),
   `--user-data-dir=${profileDir}`, '--remote-debugging-port=0', '--no-first-run', '--no-default-browser-check',
   '--disable-background-timer-throttling', '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
   '--hide-crash-restore-bubble', '--lang=zh-CN',
@@ -52,11 +124,11 @@ export const launchArgs = (profileDir: string) => [
 ];
 
 /** Starts the browser detached (it outlives a plugin reload and is adopted again) and waits for its debugging port; callers adopt a running one via `runningPort` first. */
-export async function launchBrowser(binary: string, profileDir: string, timeoutMs = 15_000): Promise<number> {
+export async function launchBrowser(binary: string, profileDir: string, timeoutMs = 15_000, mode: LaunchMode = defaultLaunchMode()): Promise<number> {
   mkdirSync(profileDir, { recursive: true });
   rmSync(portFile(profileDir), { force: true });
   let failed: Error | undefined;
-  const child = spawn(binary, launchArgs(profileDir), { detached: true, stdio: 'ignore' });
+  const child = spawn(binary, launchArgs(profileDir, mode), { detached: true, stdio: 'ignore' });
   let exitedAt = 0;
   child.once('error', error => { failed = error; });
   // Edge may hand the window to another process and exit, so an early exit only starts a short grace period.
