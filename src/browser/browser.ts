@@ -1,7 +1,8 @@
+import { basename } from 'node:path';
 import { errorText, type Faults } from '../shared/faults.ts';
 import { createQueue } from '../shared/queue.ts';
 import { closeTarget, connectCdp, newTarget, pageTargets, type Cdp, type Target } from './cdp.ts';
-import { findBrowser, launchBrowser, runningPort } from './edge.ts';
+import { existingBrowsers, launchBrowser, runningPort } from './edge.ts';
 import { createPage, type Page } from './page.ts';
 
 export interface BrowserStatus { state: 'missing' | 'stopped' | 'running'; binary: string | null }
@@ -15,10 +16,13 @@ export type Browser = ReturnType<typeof createBrowser>;
  */
 export function createBrowser(deps: {
   profileDir: string; faults: Faults; timeoutMs?: number;
-  find?: () => string | undefined; running?: (profileDir: string) => Promise<number>; launch?: (binary: string, profileDir: string) => Promise<number>;
+  find?: () => string | readonly string[] | undefined; running?: (profileDir: string) => Promise<number>; launch?: (binary: string, profileDir: string) => Promise<number>;
   targets?: (port: number) => Promise<Target[]>; open?: (port: number) => Promise<Target>; close?: (port: number, id: string) => Promise<void>; connect?: (url: string) => Promise<Cdp>;
 }) {
-  const find = deps.find ?? (() => findBrowser()), running = deps.running ?? runningPort, launch = deps.launch ?? launchBrowser;
+  // Every browser that exists, in order: one that dies on start (a snap stub, a broken install) must not decide the
+  // others are no good.
+  const find = (): readonly string[] => { const found = deps.find?.() ?? (deps.find ? [] : existingBrowsers()); return typeof found === 'string' ? [found] : found ?? []; };
+  const running = deps.running ?? runningPort, launch = deps.launch ?? launchBrowser;
   const targets = deps.targets ?? pageTargets, open = deps.open ?? (port => newTarget(port)), close = deps.close ?? closeTarget, connect = deps.connect ?? (url => connectCdp(url));
   const queue = createQueue('浏览器', { limit: 8, timeoutMs: deps.timeoutMs ?? 120_000, timeoutMessage: '浏览器操作超时（两分钟）；如果这一步会向外发出，可能已经发出，先看页面再决定' });
   let main: { cdp: Cdp; page: Page } | undefined;
@@ -28,9 +32,14 @@ export function createBrowser(deps: {
   async function port(): Promise<number> {
     const adopted = await running(deps.profileDir);
     if (adopted) return adopted;
-    const binary = find();
-    if (!binary) throw new Error('这台电脑上找不到 Edge 或 Chrome');
-    return await launch(binary, deps.profileDir);
+    const binaries = find();
+    if (!binaries.length) throw new Error('这台电脑上找不到 Edge 或 Chrome');
+    const refused: string[] = [];
+    for (const binary of binaries) {
+      try { return await launch(binary, deps.profileDir); }
+      catch (error) { refused.push(`${basename(binary)}：${errorText(error)}`); }
+    }
+    throw new Error(`试过 ${binaries.length} 个浏览器都起不来\n${refused.map(line => `- ${line}`).join('\n')}`);
   }
   /** Failures to reach the browser itself are faults; a page that refuses a click is not. */
   async function reach<T>(work: () => Promise<T>): Promise<T> {
@@ -84,7 +93,7 @@ export function createBrowser(deps: {
     /** Brings its window forward, for the user to scan a login code or watch. */
     show(): Promise<void> { return run(page => page.bringToFront()); },
     status(): BrowserStatus {
-      const binary = find() ?? null;
+      const binary = find()[0] ?? null;
       return { state: !binary ? 'missing' : main && !main.cdp.closed ? 'running' : 'stopped', binary };
     },
     stop(): void { generation++; queue.stop(); dropMain(); },

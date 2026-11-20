@@ -53,6 +53,37 @@ export function formatRead(snapshot: Snapshot, page = 1, perPage = PER_PAGE, tex
 export function createPage(cdp: Cdp): Page {
   // A new document restarts the page's numbering; carrying the highest number seen keeps an old number from ever naming another element.
   let highest = 0;
+  // A click can start a navigation the caller never asked for. The in-page library is injected with each evaluate, and an
+  // evaluate that lands in the document being torn down leaves its registry holding nodes from that document: the next
+  // read then finds elements whose document is gone. So a navigation in flight is waited out before anything is injected.
+  let navigating: Promise<void> | undefined;
+  function watchNavigation(): void {
+    if (watch === undefined) watch = cdp.on(method => {
+      if (method === 'Page.frameStartedLoading') hold();
+      // The load event is the document being there; frameStoppedLoading comes a moment later and is the last word.
+      else if (method === 'Page.loadEventFired') releaseOnly(500);
+      else if (method === 'Page.frameStoppedLoading') release();
+    });
+  }
+  let watch: (() => void) | undefined;
+  let enabled = false;
+  let settle: (() => void) | undefined, timer: ReturnType<typeof setTimeout> | undefined;
+  function hold(): void {
+    if (!settle) navigating = new Promise<void>(resolve => { settle = resolve; });
+    if (timer) clearTimeout(timer);
+    // A page that finishes without announcing it must not block the next call forever.
+    timer = setTimeout(release, 15_000);
+  }
+  function release(): void { if (timer) { clearTimeout(timer); timer = undefined; } settle?.(); settle = undefined; navigating = undefined; }
+  /** A navigation that outlives its own load event (a redirect, a document that never finishes) only gets this long. */
+  function releaseOnly(ms: number): void { if (timer) clearTimeout(timer); timer = setTimeout(release, ms); }
+  async function ready(): Promise<void> {
+    watchNavigation();
+    // Without Page.enable the browser sends no navigation events at all; asked for on first use, so making a page
+    // sends nothing by itself.
+    if (!enabled) { enabled = true; void cdp.send('Page.enable').catch(() => undefined); }
+    if (navigating) await Promise.race([navigating, new Promise(resolve => setTimeout(resolve, 15_000))]);
+  }
   async function call<T>(expression: string): Promise<T> {
     const result = await cdp.send<{ result: { value?: unknown }; exceptionDetails?: { text: string; exception?: { description?: string } } }>('Runtime.evaluate', {
       expression: `(() => {window.__evolutionCUBase = ${highest};${PAGE_LIB};\nreturn (${expression});\n})()`, returnByValue: true, awaitPromise: true,
@@ -60,21 +91,38 @@ export function createPage(cdp: Cdp): Page {
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? result.exceptionDetails.text);
     return result.result.value as T;
   }
+  /**
+   * Every evaluate goes through here. A navigation the caller did not start (a click, a redirect) is waited out first; if
+   * the evaluate still landed in a document being torn down, it is worth exactly one more try on the new one.
+   */
+  async function evaluate<T>(expression: string): Promise<T> {
+    await ready();
+    try { return await call<T>(expression); }
+    catch (error) {
+      // No navigation was announced, so this is a real failure of the page rather than the old document going away.
+      if (!navigating) throw error;
+      await ready();
+      return await call<T>(expression);
+    }
+  }
+  // From the moment the tab is ours: a navigation can start before the first evaluate, and a gate installed after that
+  // event has already gone by would never close.
+  watchNavigation();
   async function snapshot(ref?: number): Promise<Snapshot> {
     if (ref !== undefined && !Number.isSafeInteger(ref)) throw new Error(`编号 ${String(ref)} 不是有效的元素编号`);
-    const data = await call<Snapshot | { missing: true }>(`window.__evolutionCU.snapshot(${JSON.stringify(ref ?? null)}, ${TEXT_BUDGET})`);
+    const data = await evaluate<Snapshot | { missing: true }>(`window.__evolutionCU.snapshot(${JSON.stringify(ref ?? null)}, ${TEXT_BUDGET})`);
     if ('missing' in data) throw missing({ ref: ref! });
     highest = data.controls.reduce((top, control) => Number.isSafeInteger(control.ref) && control.ref > top ? control.ref : top, highest);
     return data;
   }
   async function pointOf(target: Target): Promise<{ x: number; y: number }> {
-    const point = await call<{ x: number; y: number } | { covered: true; by: string } | null>(`window.__evolutionCU.point(${JSON.stringify(target)})`);
+    const point = await evaluate<{ x: number; y: number } | { covered: true; by: string } | null>(`window.__evolutionCU.point(${JSON.stringify(target)})`);
     if (!point) throw missing(target);
     if ('covered' in point) throw new Error(`${describeTarget(target)} 被别的东西挡住了（${point.by}），先关掉它或滚动一下`);
     return point;
   }
   const mouse = (type: string, x: number, y: number, extra: Record<string, unknown> = {}) => cdp.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1, pointerType: 'mouse', ...extra });
-  async function has(condition: Condition): Promise<boolean> { return await call<boolean>(`window.__evolutionCU.has(${JSON.stringify(condition)})`); }
+  async function has(condition: Condition): Promise<boolean> { return await evaluate<boolean>(`window.__evolutionCU.has(${JSON.stringify(condition)})`); }
   return {
     async open(url) {
       await cdp.send('Page.enable');
@@ -99,7 +147,7 @@ export function createPage(cdp: Cdp): Page {
       await mouse('mouseReleased', x, y);
     },
     async type(target, text) {
-      const focused = await call<'ok' | 'missing' | 'unfocusable'>(`window.__evolutionCU.focus(${JSON.stringify(target)})`);
+      const focused = await evaluate<'ok' | 'missing' | 'unfocusable'>(`window.__evolutionCU.focus(${JSON.stringify(target)})`);
       if (focused === 'missing') throw missing(target);
       if (focused === 'unfocusable') throw new Error(`${describeTarget(target)} 这个元素不能输入`);
       await cdp.send('Input.insertText', { text });
@@ -112,7 +160,7 @@ export function createPage(cdp: Cdp): Page {
       await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
     },
     async scroll(direction, target) {
-      const { x, y } = target ? await pointOf(target) : await call<{ x: number; y: number }>('({ x: innerWidth / 2, y: innerHeight / 2 })');
+      const { x, y } = target ? await pointOf(target) : await evaluate<{ x: number; y: number }>('({ x: innerWidth / 2, y: innerHeight / 2 })');
       await mouse('mouseWheel', x, y, { button: 'none', clickCount: 0, deltaX: 0, deltaY: direction === 'down' ? 600 : -600 });
     },
     async wait(condition, timeoutMs, signal) {
@@ -126,7 +174,7 @@ export function createPage(cdp: Cdp): Page {
       }
     },
     has,
-    async extract(spec) { return await call<Row[]>(`window.__evolutionCU.extract(${JSON.stringify(spec)})`); },
+    async extract(spec) { return await evaluate<Row[]>(`window.__evolutionCU.extract(${JSON.stringify(spec)})`); },
     async evaluate(script, args) {
       const result = await cdp.send<{ result: { value?: unknown }; exceptionDetails?: { text: string; exception?: { description?: string } } }>('Runtime.evaluate', {
         expression: `Promise.race([(async (args) => {\n${script}\n})(${JSON.stringify(args)}), new Promise((_, reject) => setTimeout(() => reject(new Error('页面脚本超过十秒没有结束')), 10000))])`, returnByValue: true, awaitPromise: true, timeout: 10_000,

@@ -36,13 +36,16 @@ function fakeCdp(answer: (method: string, params: Record<string, unknown>) => un
 }
 const value = (v: unknown) => ({ result: { value: v } });
 
-test('open takes its listener away when the navigation fails', async () => {
+test('open takes its own listener away when the navigation fails', async () => {
+  // One listener stays for the life of the page, to notice navigations a click started; `open` adds a second one only
+  // while it waits, and must take it back however the wait ends.
   const { cdp, listeners } = fakeCdp(method => method === 'Page.navigate' ? { errorText: 'net::ERR_NAME_NOT_RESOLVED' } : {});
-  await assert.rejects(createPage(cdp).open('https://nowhere.invalid/'), /打不开/);
-  assert.equal(listeners.size, 0);
+  const page = createPage(cdp);
+  await assert.rejects(page.open('https://nowhere.invalid/'), /打不开/);
+  assert.equal(listeners.size, 1, 'the navigation watcher stays; the wait listener is gone');
   const thrown = fakeCdp(method => { if (method === 'Page.navigate') throw new Error('gone'); return {}; });
   await assert.rejects(createPage(thrown.cdp).open('https://x/'), /gone/);
-  assert.equal(thrown.listeners.size, 0);
+  assert.equal(thrown.listeners.size, 1);
 });
 
 test('a wait that runs out says what went wrong last', async () => {
@@ -80,4 +83,31 @@ test('a wait stops polling when its signal aborts', async () => {
   const started = Date.now();
   await assert.rejects(createPage(cdp).wait({ text: 'x' }, 10_000, controller.signal), /stopped/);
   assert.ok(Date.now() - started < 2000);
+});
+
+test('a read during a navigation the caller did not start waits for the new document instead of failing', async () => {
+  // The browser says a new document is coming; evaluates that land meanwhile fail the way Chromium fails them.
+  const listeners = new Set<(method: string, params: Record<string, unknown>) => void>();
+  let destroyed = false;
+  let reads = 0;
+  const cdp: Cdp = {
+    async send(method) {
+      if (method === 'Runtime.evaluate') {
+        if (destroyed) throw new Error("TypeError: Failed to execute 'createTreeWalker' on 'Document'");
+        reads += 1;
+        return { result: { value: { url: 'u', title: 't', controls: [], text: '' } } } as never;
+      }
+      return {} as never;
+    },
+    on(listener) { listeners.add(listener as never); return () => { listeners.delete(listener as never); }; },
+    close() {}, closed: false,
+  };
+  const page = createPage(cdp);
+  // A click started a navigation: the document is being torn down, and the load event comes shortly after.
+  for (const listener of listeners) listener('Page.frameStartedLoading', {});
+  destroyed = true;
+  setTimeout(() => { destroyed = false; for (const listener of listeners) listener('Page.loadEventFired', {}); }, 60);
+  const text = await page.brief();
+  assert.match(text, /^t · u/, 'the read comes back from the document that replaced the old one');
+  assert.ok(reads >= 1);
 });
